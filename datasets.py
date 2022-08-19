@@ -3,6 +3,7 @@ import gdown
 from zipfile import ZipFile
 
 from tensorflow import keras
+import tensorflow as tf
 
 def download_celeb_data():
     os.makedirs("celeba_gan")
@@ -117,15 +118,16 @@ class DatManipulator:
             batch_size_repc = input_context.get_per_replica_batch_size(self.global_batch)
             self.curr_dir_num_file = len(os.listdir(current_dir))
             assert self.global_batch < self.curr_dir_num_file , 'global_batch mush be smaller than each dataset subdirectory'
+            
+            with tf.device("CPU:0"):
+                datasets = keras.utils.image_dataset_from_directory(current_dir,
+                    labels=None, label_mode=None, class_names=None, color_mode='rgb', batch_size=None,
+                    image_size=self.target_image_size, shuffle=False)
 
-            datasets = keras.utils.image_dataset_from_directory(current_dir,
-                labels=None, label_mode=None, class_names=None, color_mode='rgb', batch_size=None,
-                image_size=self.target_image_size, shuffle=False)
-
-            datasets = datasets.map(lambda img : img / 255)
-            datasets = datasets.shuffle(30000)
-            datasets = datasets.batch(batch_size_repc)
-            datasets = datasets.prefetch(3)
+                datasets = datasets.map(lambda img : img / 255)
+                datasets = datasets.shuffle(30000)
+                datasets = datasets.batch(batch_size_repc)
+                datasets = datasets.prefetch(3)
 
             return datasets
         try:
