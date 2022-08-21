@@ -2,8 +2,6 @@ import tensorflow as tf
 from tensorflow import keras
 import numpy as np
 
-from utils import DefaultConfig
-
 def get_deconv(x0, filters, kernel_size=(5, 5), strides=(1, 1), padding="same", activation='relu', initializer=None, 
                    add_noise=None, max_norm=None, batch_norm=True):
     if initializer is None:
@@ -108,11 +106,18 @@ class BaseGenerator:
         else:
             self.extend_model()
 
-    def _extend_model(self):
-        raise NotImplementedError
+    def auto_extend(self):
+        if self.strategy_scope is not None:
+            with self.strategy_scope.scope():
+                self._auto_extend()
+        else:
+            self._auto_extend()
 
-    def _initialize_base(self):
-        raise NotImplementedError
+    def _extend_model(self): raise NotImplementedError
+
+    def _initialize_base(self): raise NotImplementedError
+
+    def _auto_extend(self): raise NotImplementedError
 
     def __repr__(self):
         return self.name
@@ -121,8 +126,7 @@ class BaseGenerator:
         '''forward mapping layer only'''
         raise NotImplementedError
     
-    def get_mapping_weights():
-        raise NotImplementedError
+    def get_mapping_weights(): raise NotImplementedError
     
     def forward_model(self, inputs, training=True):
         inputs = self.model(inputs, training=training)
@@ -160,10 +164,32 @@ class BaseDiscriminator:
         else:
             self._initialize_base()
 
+    def extent_model(self):
+        assert self.img_size != self.targ_img_size, "provided img_size is equal to targ_img_size, so it cannot be extended"
+        if self.strategy_scope is not None:
+            with self.strategy_scope.scope():
+                self.extend_model()
+        else:
+            self.extend_model()
+
+    def auto_extend(self):
+        assert self.img_size != self.targ_img_size, "provided img_size is equal to targ_img_size, so it cannot be extended"
+        if self.strategy_scope is not None:
+            with self.strategy_scope.scope():
+                self._auto_extend()
+        else:
+            self._auto_extend()
+    
+    def _extend_model(self): raise NotImplementedError
+
+    def _initialize_base(self): raise NotImplementedError
+
+    def _auto_extend(self): raise NotImplementedError
+
 class Generator_v0(BaseGenerator):
     
     def __init__(self, img_size=(32, 32), targ_img_size=(128, 128), z_dim=128, seed=1010, strategy_scope=None, name="GEN01",
-                up_type="deconv", out_units=256, dense_units=256):
+                up_type="deconv", apply_resize=False):
         '''
         Input : 
             image_size : (tuple) target image size at starting training (before first extent model)
@@ -174,12 +200,10 @@ class Generator_v0(BaseGenerator):
         assert img_size[0] == img_size[1], "img_size must be square"
         assert targ_img_size[0] == targ_img_size[1], "targ_img_size must be square"
         self.up_type = up_type
-        self.dense_units = dense_units 
-        self.num_layers = 6
-        self.out_units = out_units
         self.blocks = []
         self.cur_img_size = img_size
-    
+        self.apply_resize = apply_resize
+        
     def _initialize_base(self):
         '''Initialize model for based layer map and conv'''
         self.inputer = keras.layers.Input(shape=(self.z_dim))
@@ -190,34 +214,36 @@ class Generator_v0(BaseGenerator):
 
         if self.up_type == "deconv":
             for i_layer in self.configbuild["BaseFilters"]:
-                x1 = get_deconv(x1, i_layer, self.configbuild["kernel_size"], strides=(2, 2), padding="same", activation=self.configbuild["conv_act"], initializer=self.initializer, 
-                        add_noise=None, max_norm=None, batch_norm=True)
+                x1 = get_deconv(x1, i_layer, self.configbuild["kernel_size"], strides=(2, 2), padding="same", activation=self.configbuild["conv_act"], 
+                        initializer=self.initializer, add_noise=None, max_norm=None, batch_norm=True)
         
         elif self.up_type == "upsample":
             for i_layer in self.configbuild["BaseFilters"]:
-                x1 = get_upsampling(x1, i_layer, self.configbuild["kernel_size"], strides=(1, 1), padding="same", up_size=(2, 2), activation=self.configbuild["conv_act"], 
-                    interpolation="nearest", initializer=self.initializer, add_noise=None, batch_norm=True)
+                x1 = get_upsampling(x1, i_layer, self.configbuild["kernel_size"], strides=(1, 1), padding="same", up_size=(2, 2), 
+                activation=self.configbuild["conv_act"], interpolation="nearest", initializer=self.initializer, add_noise=None, batch_norm=True)
                 
-        self.outputer = keras.layers.Conv2D(3, self.configbuild["kernel_size"], strides=(1, 1), padding="same", activation=self.self.configbuild["out_act"], use_bias=True)(x1)
+        self.outputer = keras.layers.Conv2D(3, self.configbuild["kernel_size"], strides=(1, 1), padding="same", activation=self.configbuild["out_act"], use_bias=True)(x1)
         assert tf.reduce_prod(x1.shape[1:-1]) == tf.reduce_prod(self.img_size), "mapping blocks do not correctly output shape, "\
         "must provide filters with length of {}".format(int(np.log2(self.img_size[0])))
         self.model = keras.Model(self.inputer, self.outputer)
-        
-    def _extend_model(self, filters=200, up=(1, 1), noise=get_noise_out):
+
+    def _extend_model(self, filters=400, up=(1, 1), noise=get_noise_out):
         '''extent conv block'''
+        assert self.cur_img_size != self.targ_img_size, "extent model cannot be called when image size is equal to target image size"
         if not self.initialized:
             raise ValueError("Generator model not initialized")
         self.cur_img_size = (self.cur_img_size[0] * up[0], self.cur_img_size[0] * up[1])
         last_shape = self.outputer.shape
         
         if self.up_type == "deconv":
-            self.outputer = get_deconv(self.outputer, filters, self.configbuild["kernel_size"], strides=up, padding="same", activation='selu', initializer=self.initializer, 
-                add_noise=noise, max_norm=None, batch_norm=True)
+            self.outputer = get_deconv(self.outputer, filters, self.configbuild["kernel_size"], strides=up, padding="same",
+                activation=self.configbuild["conv_act"], initializer=self.initializer, add_noise=noise, max_norm=None, batch_norm=True)
         
         elif self.up_type =="upsample":
-            self.outputer = get_upsampling(self.outputer, filters, self.configbuild["kernel_size"], strides=(1, 1), padding="same", up_size=up, activation='selu', 
-                interpolation="nearest", initializer=self.initializer, add_noise=noise, batch_norm=True)
-        
+            self.outputer = get_upsampling(self.outputer, filters, self.configbuild["kernel_size"], strides=(1, 1), padding="same", 
+                up_size=up, activation=self.configbuild["conv_act"], interpolation="nearest", initializer=self.initializer, 
+                add_noise=noise, batch_norm=True)
+            
         if up[0] > 1:
             self.outputer = keras.layers.Conv2D(3, (5, 5), strides=(1, 1), padding="same", activation=None, use_bias=True)(self.outputer)
             assert tf.reduce_prod(self.outputer.shape[1:-1]) == tf.reduce_prod(self.cur_img_size), "extended model do not correctly output shape"\
@@ -225,15 +251,33 @@ class Generator_v0(BaseGenerator):
         self.model = keras.Model(self.inputer, self.outputer)
         print("extended model from size of", last_shape, "to", self.outputer.shape)
     
-    def auto_extend(self, filters=[300, 300, 300], noise=get_noise_out):
-        for ifilt in filters[:-1]:
+    def _auto_extend(self):
+        for ifilt in next(iter(self.configbuild["filters"]))[:-1]:
             self._extend_model(ifilt, up=(1, 1))
-        self._extend_model(filters[-1], up=(2, 2), noise=noise)
+        self._extend_model(next(iter(self.configbuild["filters"]))[-1], up=(2, 2), noise=get_noise_out)
 
+    def set_mapping_trainable(self, trainable=True, prefix='map_z'):
+        for ly in self.model.layers:
+            if prefix in ly.name:
+                ly.trainable = trainable
+                print("set trainable_variables of layers {} to {}".format(ly.name, trainable))
+    
+    def set_joint_trainable(self, trainable=True, not_prefix='map_z'):
+        for ly in self.model.layers:
+            if not_prefix not in ly.name and ly.trainable_variables != []:  
+                ly.trainable = trainable
+                print("set trainable_variables of layers {} to {}".format(ly.name, trainable))
+                
+    def forward_model(self, inputs, training=True):
+        inputs = self.model(inputs, training=training)
+        if self.apply_resize and self.cur_img_size != self.targ_img_size:
+            inputs = tf.image.resize(inputs, self.targ_img_size, method="nearest")
+        return tf.cast(inputs, dtype=tf.float32)
+    
 class Discriminator_v0(BaseDiscriminator):
     
     def __init__(self, img_size=(32, 32), targ_img_size=(128, 128), z_dim=200, seed=5005, strategy_scope=None, 
-            name="BaseDiscriminator", extendable=False):
+            name="BaseDiscriminator", extendable=False, resizing=True):
         '''
         Input : 
             img_size : (tuple) target image size at starting training (before first extent model)
@@ -243,35 +287,37 @@ class Discriminator_v0(BaseDiscriminator):
         super(Discriminator_v0, self).__init__(img_size, targ_img_size, z_dim, seed, strategy_scope, name)
         assert img_size[0] == img_size[1], "img_size must be square"
         assert targ_img_size[0] == targ_img_size[1], "targ_img_size must be square"
-        self.out_units = 200
         self.cur_img_size = self.img_size
         self.extendable = extendable
+        self.resizing = resizing
         self.blocks = []
 
     def extend_size(self):
         self.cur_img_size = (self.cur_img_size[0] * 2, self.cur_img_size[1] * 2)
 
-    def _initialize_base(self, filters, units_dense, act_out=None):
+    def _initialize_base(self):
         '''Initialize model for based layer map and conv'''
         self.initialized = True
         if not self.extendable:
             cur_in = keras.layers.Input(shape=(*self.targ_img_size, 3))
         else :
             cur_in = keras.layers.Input(shape=(*self.cur_img_size, 3))
-        x1 = get_downsampling_conv(cur_in, filters[0], kernel_size=(5, 5), strides=(1, 1), padding="same", 
-                activation='relu', pooling=(2, 2), initializer=self.initializer, add_noise=None, max_norm=None, batch_norm=True)
+        x1 = get_downsampling_conv(cur_in, self.configbuild["BaseFilters"][0], self.configbuild["kernel_size"], (1, 1), "same",  
+                self.configbuild["conv_act"], (2, 2), self.initializer, add_noise=None, max_norm=None, batch_norm=True)
         
-        for filts in filters[1:]:
-            x1 = get_downsampling_conv(x1, filts, kernel_size=(5, 5), strides=(1, 1), padding="same", 
-                activation='relu', pooling=(2, 2), initializer=self.initializer, add_noise=None, max_norm=None, batch_norm=True)
+        for filts in self.configbuild["BaseFilters"][1:]:
+            x1 = get_downsampling_conv(x1, filts, self.configbuild["kernel_size"], (1, 1), "same", self.configbuild["conv_act"], (2, 2), 
+                self.initializer, add_noise=None, max_norm=None, batch_norm=True)
+
         x1 = keras.layers.Flatten(name="flatten_d_conv")(x1)
-        for ui in units_dense:
-            x1 = keras.layers.Dense(ui, activation='selu', use_bias=True, kernel_initializer=self.initializer)(x1)
-        cur_out = keras.layers.Dense(1, activation=act_out)(x1)
-        if not self.extendable:
+        for ui in self.configbuild["units_dense"]:
+            x1 = keras.layers.Dense(ui, activation=self.configbuild["dense_act"], use_bias=True, kernel_initializer=self.initializer)(x1)
+        cur_out = keras.layers.Dense(1, activation=self.configbuild["out_act"])(x1)
+        if self.extendable:
             m = keras.Model(cur_in, cur_out)
             self.blocks.append(m)
-        else: self.model = keras.Model(cur_in, cur_out)
+        else: 
+            self.model = keras.Model(cur_in, cur_out)
             
     def forward_model(self, inputs, training=True):
         
@@ -281,19 +327,22 @@ class Discriminator_v0(BaseDiscriminator):
             if multiplier > 1:
                 inputs = keras.layers.UpSampling2D((multiplier, multiplier), interpolation="nearest")(inputs)     
             return self.model(inputs, training=training)
+        elif self.extendable == False and self.resizing is not None:
+            inputs = tf.image.resize(inputs, self.targ_img_size, method="nearest") # naive resize method
         else:
             for ly in reversed(self.blocks):
                 inputs = ly(inputs, training=training)
             return inputs
 
-    def auto_extend(self, filters):
+    def _auto_extend(self):
         assert self.cur_img_size != self.targ_img_size, "cannot extend model, current input shape exceed targ_img_size"
         if self.extendable:
             self.extend_size()
             cur_in = keras.layers.Input(shape=(*self.cur_img_size, 3))
-            x1 = get_downsampling_conv(cur_in, filters[0], kernel_size=(5, 5), strides=(1, 1), padding="same", 
+
+            x1 = get_downsampling_conv(cur_in, next(iter(self.configbuild["filters"]))[0], kernel_size=(5, 5), strides=(1, 1), padding="same", 
                         activation='relu', pooling=(1, 1), initializer=self.initializer, add_noise=None, max_norm=None, batch_norm=True)
-            for ifilt in filters[1:]:
+            for ifilt in next(iter(self.configbuild["filters"]))[1:]:
                 x1 = get_downsampling_conv(x1, ifilt, kernel_size=(5, 5), strides=(1, 1), padding="same", 
                     activation='relu', pooling=(1, 1), initializer=self.initializer, add_noise=None, max_norm=None, batch_norm=True)
                 
@@ -304,7 +353,7 @@ class Discriminator_v0(BaseDiscriminator):
         else:
             raise ValueError("This Discriminator is not extendable")
     
-    def get_model(self, get_with_functional=True):
+    def get_model(self, get_with_functional=True, with_scope=False):
         assert self.extendable, "This Discriminator is not extendable"
         assert self.cur_img_size == self.targ_img_size, 'get_model cannot be called if model still not extend to targ_img_size'
         if get_with_functional: U_layers = list(reversed(self.blocks))
@@ -316,9 +365,16 @@ class Discriminator_v0(BaseDiscriminator):
         xi = U_layers[0](self.inputer)
         for J_layers in U_layers[1:]:
             xi = J_layers(xi)
-            
-        return keras.Model(self.inputer, xi)
+        if with_scope:
+            with self.strategy_scope.scope():
+                return keras.Model(self.inputer, xi)
+        else:
+            return keras.Model(self.inputer, xi)
 
+    def set_instance_model(self):
+        if self.extendable:
+            self.model = self.get_model(get_with_functional=False, with_scope=True)
+            
 class Discriminator_v1(BaseDiscriminator):
     
     def __init__(self, img_size=(32, 32), targ_img_size=None, z_dim=128, seed=1010, strategy_scope=None, name="DISC02"):
@@ -389,4 +445,3 @@ class Generator_v1(BaseGenerator):
         
     def forward_model(self, input_tensor, training=True):
         return self.model(input_tensor, training=training)
-

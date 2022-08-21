@@ -9,20 +9,19 @@ import os
 class DefaultConfig(object):
     """Default configuration for training"""
     # General parameters
-    epochs = 100
+    epochs = 10
     G_lr = 0.0001
     D_lr = 0.0001
+    optimizer = "RMSprop"
     lr_schedual = "linear"
     latent_z_dim = 200
     img_size = (32, 32)
     targ_img_size = (128, 128)
     n_gpu = ["GPU:0", "GPU:1"]
-    log_dir = "TrainGans"
-    stopdata = False
-    seed = 5005
-    TrainDict = None
     clip_norm = 3
     train_ratio = None
+    grad_penalty = 2
+    applied_D_method = "resize"
 
     def __init__(self, **kwargs):
         """Update default configuration"""
@@ -78,10 +77,9 @@ class Timer:
         self.end = time.time()
         self.elapsed = self.end - self.begin
         self.elapsedH = time.gmtime(self.elapsed)
-        print('====> [{}] Time: {:7.3f}s or {}'.format(self.elapsed, time.strftime("%H:%M:%S", self.elapsedH)))
 
-pre_build_G = {"BaseFilters" : [300, 400, 500],
-                "filters" : ([300, 300, 200], [300, 300, 200], [300, 300, 200]),
+pre_build_G = {"BaseFilters" : [300, 400 ,500, 400, 300],
+                "filters" : ([300, 300, 200], [300, 300, 200]),
                 "out_units" : 300, 
                 "add_noise" : True,
                 "dense_act" : "selu",
@@ -91,11 +89,14 @@ pre_build_G = {"BaseFilters" : [300, 400, 500],
                 "dense_units" : 200,
                 "kernel_size" : (5, 5)}
 
-pre_build_D = {"BaseFilters" : [300, 400, 500],
-                "filters" : ([300, 300, 200], [300, 300, 200], [300, 300, 200]),
+pre_build_D = {"BaseFilters" : [300, 400 ,500, 400, 300],
+                "filters" : ([300, 300, 200], [300, 300, 200]),
                 "out_units" : 300, 
+                "units_dense" : [300 , 300],
                 "add_noise" : True,
-                "activation" : "selu",
+                "conv_act" : "selu",
+                "dense_act" : "selu",
                 "out_act" : "selu",
                 "num_layers" : 6,
+                "kernel_size" : (5, 5),
                 "dense_units" : 200}

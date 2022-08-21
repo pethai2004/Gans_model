@@ -6,14 +6,16 @@ from tensorflow import keras
 import tensorflow as tf
 
 def download_celeb_data():
-    os.makedirs("celeba_gan")
-
+    try:
+        os.makedirs("data")
+    except:
+        pass
     url = "https://drive.google.com/uc?id=1O7m1010EJjLE5QxLZiM9Fpjs7Oj6e684"
-    output = "celeba_gan/data.zip"
+    output = "data/data.zip"
     gdown.download(url, output, quiet=True)
 
-    with ZipFile("celeba_gan/data.zip", "r") as zipobj:
-        zipobj.extractall("celeba_gan")
+    with ZipFile("data/data.zip", "r") as zipobj:
+        zipobj.extractall("data")
 
 def chunk_datasets(dir_path, num=3, del_left=True):
     files_all = sorted([f for f in os.listdir(dir_path) if os.path.isfile(os.path.join(dir_path, f))])
@@ -89,10 +91,6 @@ def rename_all(dir_path):
     for P in dir_path:
         os.rename(P, str(idx) + os.path.splitext(P)[-1])
         idx+=1
-
-def get_one_chunk(global_batch, parent_path, strategy, target_image_size=(100, 100)):
-    datas = strategy.distribute_datasets_from_function(dataset_func_img_ch)
-    return datas
 
 class DatManipulator:
     
