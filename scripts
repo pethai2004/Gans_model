@@ -1,0 +1,21 @@
+curl https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh -o Miniconda3-latest-Linux-x86_64.sh
+bash Miniconda3-latest-Linux-x86_64.sh
+
+conda create --name tf python=3.9
+
+conda install -c conda-forge cudatoolkit=11.2 cudnn=8.1.0
+export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:$CONDA_PREFIX/lib/
+mkdir -p $CONDA_PREFIX/etc/conda/activate.d
+echo 'export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:$CONDA_PREFIX/lib/' > $CONDA_PREFIX/etc/conda/activate.d/env_vars.sh
+
+pip install --upgrade pip
+pip install tensorflow
+pip install tensorflow_probability
+pip install tensorflow_datasets
+pip install jupyter
+pip install jupyterlab
+pip install matplotlib
+pip install gdown
+pip install tensorboard_plugin_profile
+pip install pysocks
+

@@ -1,0 +1,9 @@
+tensorflow
+tensorflow_probability
+tensorflow_datasets
+jupyter
+jupyterlab
+matplotlib
+gdown
+tensorboard_plugin_profile
+pysocks

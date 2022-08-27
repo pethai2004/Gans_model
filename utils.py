@@ -10,8 +10,10 @@ class DefaultConfig(object):
     """Default configuration for training"""
     # General parameters
     epochs = 10
-    G_lr = 0.0001
-    D_lr = 0.0001
+    G_lr = 0.00001
+    D_lr = 0.00001
+    max_G_lr = 0.0001
+    max_D_lr = 0.0001
     optimizer = "RMSprop"
     lr_schedual = "linear"
     latent_z_dim = 200
@@ -22,7 +24,8 @@ class DefaultConfig(object):
     train_ratio = None
     grad_penalty = 2
     applied_D_method = "resize"
-
+    switch_ratio = {"G" : 2, "D" : 1}
+    
     def __init__(self, **kwargs):
         """Update default configuration"""
         for k, v in kwargs.items():
@@ -89,8 +92,8 @@ pre_build_G = {"BaseFilters" : [300, 400 ,500, 400, 300],
                 "dense_units" : 200,
                 "kernel_size" : (5, 5)}
 
-pre_build_D = {"BaseFilters" : [300, 400 ,500, 400, 300],
-                "filters" : ([300, 300, 200], [300, 300, 200]),
+pre_build_D = {"filters" : [(200, 2), (300, 2), (300, 2), 
+                             (200, 2), (300, 2), (300, 2), (300, 2)] ,
                 "out_units" : 300, 
                 "units_dense" : [300 , 300],
                 "add_noise" : True,
@@ -100,3 +103,31 @@ pre_build_D = {"BaseFilters" : [300, 400 ,500, 400, 300],
                 "num_layers" : 6,
                 "kernel_size" : (5, 5),
                 "dense_units" : 200}
+
+def cosine_annealing(step, total_steps, lr_max, lr_min):
+    return lr_min + (lr_max - lr_min) * 0.5 * (1 + np.cos(step / total_steps * np.pi))
+
+def exponential_annealing(step, total_steps, lr_max, lr_min):
+    return lr_min + (lr_max - lr_min) * 0.5 * (1 + np.exp(-step / total_steps))
+
+def linear_annealing(step, total_steps, lr_max, lr_min):
+    return lr_min + (lr_max - lr_min) * step / total_steps
+
+class AlphaDecay:
+
+    def __init__(self, total_steps, lr_max=0.0001, lr_min=0.000001, decay_type="linear"):
+        
+        self.decay_type = decay_type
+        self.total_steps = total_steps
+        self.lr_max = lr_max
+        self.lr_min = lr_min
+
+    def __call__(self, step):
+        if self.decay_type == "linear":
+            return linear_annealing(step, self.total_steps, self.lr_max, self.lr_min)
+        elif self.decay_type == "cosine":
+            return cosine_annealing(step, self.total_steps, self.lr_max, self.lr_min)
+        elif self.decay_type == "exponential":
+            return exponential_annealing(step, self.total_steps, self.lr_max, self.lr_min)
+        else:
+            raise ValueError("Unknown decay type: {}".format(self.decay_type))

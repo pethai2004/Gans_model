@@ -167,10 +167,9 @@ class DatManipulator:
         '''Resample pass datasets'''
         self.dir_chunk = iter(sorted([i for i in os.listdir(self.parents_dir) if 'fold_chunk_' in i]))
 
-    def set_targ_img_size(self, size=(32, 32)):
+    def update_size(self, size=(32, 32)):
         print("chage image target size from {} to {}, this will apply for the next chunk only".format(self.target_image_size, size))
         self.target_image_size = size
         
     def __next__(self):
         return self.get_batch()
-
