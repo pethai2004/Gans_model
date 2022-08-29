@@ -22,7 +22,7 @@ ResultsTrainD = namedtuple("ResultsTraiD", ['d_loss', 'grad_d_norm', 'd_g_loss',
 class Trainer:
 	'''Trainer for generative adversarial model'''
 	def __init__(self, G, D, global_batch=3000, log_dir="TrainGans01", stopdata=False, seed=5005, TrainDict=DefaultConfig, snap_short=True,
-			mem_limit=None, dataset_dir="data", save_model=100, alpha_decay=True, save_freq=20):
+			mem_limit=None, dataset_dir="data", save_model=100, alpha_decay=None, save_freq=20):
 
 		assert isinstance(G, BaseGenerator), "G must be a subclass of BaseGenerator"
 		assert isinstance(D, BaseDiscriminator), "D must be a subclass of BaseDiscriminator"
@@ -51,6 +51,9 @@ class Trainer:
 		self.cur_img_size = None
 		self.alpha_decay = alpha_decay if alpha_decay is None else {"D":None, "G":None}
 		self.save_freq = save_freq
+		self.g_loss_fn = "gen"
+		self.d_loss_fn = "gen"
+		self.save_temp_model = "temp_model"
 
 	def initialize_trainer(self):
 		assert self.G.img_size == self.img_size, "G.img_size must be equal to Trainer.img_size"
@@ -94,7 +97,10 @@ class Trainer:
 		self.D.optimizer = self.D_opt
 		self.G.initialize_base()
 		self.D.initialize_base()
-
+		bt = int(np.log2(self.targ_img_size[0])) - int(np.log2(self.img_size[0]))
+		# for _ in range(bt):
+		# 	self.G.auto_extend()
+		bt += 1 # not relevent to previous one
 		if self.TrainDict.train_ratio == None:
 			bt = int(np.log2(self.targ_img_size[0])) - int(np.log2(self.img_size[0])) + 1
 			start = int(np.log2(self.img_size[0]))
@@ -112,7 +118,13 @@ class Trainer:
 		if self.alpha_decay is not None:
 			self.alpha_decay["G"] = AlphaDecay(self.TrainDict.epochs, lr_max=self.TrainDict.max_G_lr, lr_min=self.TrainDict.G_lr, decay_type=self.TrainDict.lr_schedual)
 			self.alpha_decay["D"] = AlphaDecay(self.TrainDict.epochs, lr_max=self.TrainDict.max_D_lr, lr_min=self.TrainDict.D_lr, decay_type=self.TrainDict.lr_schedual)
-
+		
+		#setting up loss function for generative and discriminative model
+		if self.g_loss_fn == "wgan": self.g_loss_fn = generator_loss_wg
+		else: self.g_loss_fn = generator_loss_0
+		if self.d_loss_fn == "wgan": self.d_loss_fn = discrim_loss_wg
+		else: self.d_loss_fn = discrim_loss_0
+		
 	def set_lr_schedule(self, summary=True):
 		if self.alpha_decay is not None:
 			cur_g_lr = self.alpha_decay["G"](self.generator_steps.numpy())
@@ -136,12 +148,14 @@ class Trainer:
 	def g_train_step(self, true_img_k, z_k, trainable_variables):
 		TM_G = Timer()
 		with TM_G, tf.GradientTape() as G_tape, tf.name_scope("GeneratorLoss"):
-			gen_L = generator_loss_0(z=z_k, G=self.G, D=self.D, train_sets=true_img_k)
+			gen_L = self.g_loss_fn(z=z_k, G=self.G, D=self.D, train_sets=true_img_k)
 		gen_G = G_tape.gradient(gen_L, trainable_variables)
 		assert gen_G, "generator gradient is empty"
 		if self.TrainDict.clip_norm:
 			gen_G = tf.clip_by_global_norm(gen_G, self.TrainDict.clip_norm, name='clip_norm_G')
-		self.G.update_params(gen_G)
+
+		self.G_opt.apply_gradients(zip(gen_G, trainable_variables))
+
 		with tf.name_scope("GradientNorm"):
 			grad_D_norm = tf.linalg.global_norm(gen_G)
 		return ResultsTrainG(gen_L, grad_D_norm, TM_G.elapsed)
@@ -150,7 +164,7 @@ class Trainer:
 	def d_train_step(self, true_img_k, z_k, trainable_variables):
 		TM_D = Timer()
 		with TM_D, tf.GradientTape() as tape_D, tf.name_scope("DiscriminatorLoss"):
-			disc_L, disc_g_loss = discrim_loss_0(z=z_k, G=self.G, D=self.D, train_sets=true_img_k, g_penalty=self.TrainDict.grad_penalty)
+			disc_L, disc_g_loss, args_v = self.d_loss_fn(z=z_k, G=self.G, D=self.D, train_sets=true_img_k, g_penalty=self.TrainDict.grad_penalty)
 			disc_G = tape_D.gradient(disc_L, trainable_variables)
 		assert disc_G, "discriminator gradient is empty"
 		if self.TrainDict.clip_norm:
@@ -162,7 +176,7 @@ class Trainer:
 			self.D.update_params(disc_G)
 		with tf.name_scope("GradientNorm"):
 			grad_G_norm = tf.linalg.global_norm(disc_G)
-		return ResultsTrainD(disc_L, disc_g_loss, grad_G_norm, TM_D.elapsed)
+		return ResultsTrainD(disc_L, disc_g_loss, grad_G_norm, TM_D.elapsed), args_v
 
 	def TRAIN(self, num_epochs=None):
 		num_epochs = self.TrainDict.epochs if num_epochs == None else num_epochs
@@ -177,13 +191,15 @@ class Trainer:
 			z_k = self.strategy.run(self.get_latent)
 			if data_k is None: data_k = next(self.data_handler) 
 			else: pass
-			ResultsD = self.strategy.run(self.d_train_step, args=(data_k, z_k, self.D.get_trainable()))
+			ResultsD, args_v = self.strategy.run(self.d_train_step, args=(data_k, z_k, self.D.get_trainable()))
 			
 			disc_L = tf.reduce_mean(self.strategy.experimental_local_results(ResultsD.d_loss))
 			grad_D_norm = tf.reduce_mean(self.strategy.experimental_local_results(ResultsD.grad_d_norm))
 			disc_g_loss = tf.reduce_mean(self.strategy.experimental_local_results(ResultsD.d_g_loss))
 			time_D = tf.reduce_mean(self.strategy.experimental_local_results(ResultsD.time_D))
-
+			r_value = tf.reduce_mean(self.strategy.experimental_local_results(args_v[1]))
+			f_value = tf.reduce_mean(self.strategy.experimental_local_results(args_v[0]))
+			
 			with self.summarizer.as_default():
 				if self.global_train_steps == 0:
 					tf.summary.trace_export(name="graph_trace", step=0, profiler_outdir=self.log_dir)
@@ -215,26 +231,28 @@ class Trainer:
 						snp = self.G.forward_model(z_local)
 					tf.summary.image("Snapshot", snp, self.global_train_steps)
 			self.generator_steps.assign_add(1)
+		
+		with self.summarizer.as_default(), tf.name_scope("params_norm"):
+			p_norm_g = tf.reduce_mean(self.strategy.experimental_local_results(
+				tf.linalg.global_norm(self.G.get_trainable())))
+			p_norm_d = tf.reduce_mean(self.strategy.experimental_local_results(
+				tf.linalg.global_norm(self.D.model.trainable_variables)
+			))
+			tf.summary.scalar("generator_params_norm", p_norm_g, self.global_train_steps)
+			tf.summary.scalar("discriminator_params_norm", p_norm_d, self.global_train_steps)
 
 		self.global_train_steps.assign_add(1)
 		if (self.generator_steps + self.discriminator_steps) % self.TrainDict.train_ratio[self.cur_img_size] == 0:
 			if self.TrainDict.img_size != self.TrainDict.targ_img_size:
-				self.G.auto_extend()
+				# self.G._num_call_forw += 1
 				# solve update step temperary after calling Generator.auto_extend()
-				with self.strategy.scope():
-					if isinstance(self.G_opt, tf.keras.optimizers.RMSprop):
-						self.G_opt = tf.keras.optimizers.RMSprop(self.TrainDict.G_lr)
-					elif isinstance(self.G_opt, tf.keras.optimizers.Adam):
-						self.G_opt = tf.keras.optimizers.Adam(self.TrainDict.G_lr)
-					else : self.G_opt = tf.keras.optimizers.SGD(self.TrainDict.G_lr)
-				self.G.optimizer = self.G_opt
 				self.cur_img_size *= 2
 				self.data_handler.targ_img_size = self.cur_img_size
 
 		self.set_lr_schedule()
 		if self.global_train_steps % self.save_freq == 0:
-			self.G.save_model(path=os.path.join(self.log_dir, "generator_checkpoint"), name="G_" + str(self.global_train_steps))
-			self.D.save_model(path=os.path.join(self.log_dir, "discriminator_checkpoint"), name="D_" + str(self.global_train_steps))
+			self.G.save_model(path=os.path.join(self.log_dir, "generator_checkpoint", "G_" + str(self.global_train_steps)))
+			self.D.save_model(path=os.path.join(self.log_dir, "discriminator_checkpoint", "D_"+ str(self.global_train_steps)))
 		tf.keras.backend.clear_session()
 
 		print("EPOCH : {} TIME : {} D_LOSS : {} G_LOSS : {}".format(self.global_train_steps.numpy(), 

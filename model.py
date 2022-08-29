@@ -1,6 +1,7 @@
 import tensorflow as tf
 from tensorflow import keras
 import numpy as np
+#TODO : change processing in forward_model call in generator to be preprocessed in data_handler instead 
 
 def get_deconv(x0, filters, kernel_size=(5, 5), strides=(1, 1), padding="same", activation='relu', initializer=None, 
                    add_noise=None, max_norm=None, batch_norm=True, name_suffix=""):
@@ -81,7 +82,7 @@ class NameCaller(object):
         
 class BaseGenerator:
 
-    def __init__(self, img_size=(32, 32), targ_img_size=(128, 128), z_dim=200, seed=5005, strategy_scope=None, name="BaseGenerator"):
+    def __init__(self, img_size=(32, 32), targ_img_size=(128, 128), z_dim=200, seed=5005, strategy_scope=None, name="BaseGenerator", configbuild={}):
         self.img_size = img_size
         self.targ_img_size = targ_img_size
         self.z_dim = z_dim
@@ -92,7 +93,7 @@ class BaseGenerator:
         self.model = None
         self.name = name
         self.extendable = True
-        self.configbuild = {}
+        self.configbuild = configbuild
 
     def initialize_base(self):
         assert self.initialized == False, "Generator already initialized"
@@ -145,7 +146,7 @@ class BaseGenerator:
 
 class BaseDiscriminator:
 
-    def __init__(self, img_size=(32, 32), targ_img_size=(128, 128), seed=1010, strategy_scope=None, name="DISC01"):
+    def __init__(self, img_size=(32, 32), targ_img_size=(128, 128), seed=1010, strategy_scope=None, name="DISC01", configbuild={}):
         self.img_size = img_size
         self.targ_img_size = targ_img_size
         self.seed = seed
@@ -155,7 +156,7 @@ class BaseDiscriminator:
         self.model = None
         self.id = None
         self.name = name
-        self.configbuild = {}
+        self.configbuild = configbuild
         self.model = None
 
     def initialize_base(self):
@@ -192,7 +193,7 @@ class BaseDiscriminator:
 class Generator_v0(BaseGenerator):
     
     def __init__(self, img_size=(32, 32), targ_img_size=(128, 128), z_dim=128, seed=1010, strategy_scope=None, name="GEN01",
-                up_type="deconv", apply_resize=False):
+                up_type="deconv", apply_resize=False, configbuild={}):
         '''
         Input : 
             image_size : (tuple) target image size at starting training (before first extent model).
@@ -200,7 +201,7 @@ class Generator_v0(BaseGenerator):
             apply_resize : (bool) whether to resize the img_size to the targ_img_size if is not equal in the forward call.
         '''
 
-        super(Generator_v0, self).__init__(img_size, targ_img_size, z_dim, seed, strategy_scope, name)
+        super(Generator_v0, self).__init__(img_size, targ_img_size, z_dim, seed, strategy_scope, name, configbuild)
         assert up_type in ["deconv", "upsample"], "up_type must be one of deconv or upsample"
         assert img_size[0] == img_size[1], "img_size must be square"
         assert targ_img_size[0] == targ_img_size[1], "targ_img_size must be square"
@@ -212,6 +213,9 @@ class Generator_v0(BaseGenerator):
         self.suff = NameCaller()
         self.optimizer = None
         self.cur_trainable = None # use just for creation of Variable that hold outside of tf.function
+        self._num_call_forw = 0
+        self._n_call = [len(k_) for k_ in self.configbuild["filters"]]
+        self._n_call.insert(0, 1)
 
     def _initialize_base(self):
         '''Initialize model for based layer map and conv'''
@@ -267,6 +271,7 @@ class Generator_v0(BaseGenerator):
         print("extended model from size of", last_shape, "to", outputer.shape)
     
     def _auto_extend(self):
+
         '''extend model automatically with arbitrary number of blocks provided in configbuild'''
         for ifilt in next(iter(self.configbuild["filters"]))[:-1]:
             self._extend_model(ifilt, up=(1, 1))
@@ -284,10 +289,12 @@ class Generator_v0(BaseGenerator):
                 ly.trainable = trainable
                 print("set trainable_variables of layers {} to {}".format(ly.name, trainable))
                 
-    def forward_model(self, inputs, training=True): ############ use get_model instead of calling function sequentially, this may result in async weights update
-        for bk in self.blocks:
+    def forward_model(self, inputs, training=True, full_forw=True): ############ use get_model instead of calling function sequentially, this may result in async weights update
+        full_forw = np.sum(self._n_call[:self._num_call_forw+1], dtype=np.int32) if not full_forw else None
+        for bk in self.blocks[:]:
             inputs = bk(inputs)
-        if (self.apply_resize and self.cur_img_size != self.targ_img_size):
+        if self.apply_resize: # this however should be preprocess in datasets data handler
+        #if (self.apply_resize and self.cur_img_size != self.targ_img_size):
             inputs = tf.image.resize(inputs, self.targ_img_size, method="nearest")
         return tf.cast(inputs, dtype=tf.float32)
     
@@ -317,12 +324,15 @@ class Generator_v0(BaseGenerator):
             print("Name:{} - in_shape:{} - out_shape:{} - trainable:{} - scope{}".format(
             i_layer.name, i_layer.input_shape, i_layer.output_shape, i_layer.trainable, i_layer.name_scope()))
     
-    def get_trainable(self):
+    def get_trainable(self, full_forw=False):
         # self.cur_trainable = self.get_model().trainable_variables
         self.cur_trainable = []
-        for iu in self.get_flat_layers():
-            for s in iu.trainable_variables:
-                self.cur_trainable.append(s)
+        if full_forw:
+            for iu in self.get_flat_layers():
+                for s in iu.trainable_variables: self.cur_trainable.append(s)
+        else : 
+            for iu in self.blocks[:np.sum(self._n_call[:self._num_call_forw+1], dtype=np.int32)]:
+                for s in iu.trainable_variables:  self.cur_trainable.append(s)
         return self.cur_trainable
 
     def update_params(self, grads):
@@ -336,11 +346,12 @@ class Generator_v0(BaseGenerator):
 
 class Discriminator_v1(BaseDiscriminator):
     
-    def __init__(self, img_size=(32, 32), targ_img_size=(128, 128), seed=1010, strategy_scope=None, name="DISC02"):
-        super(Discriminator_v1, self).__init__(img_size, targ_img_size , seed, strategy_scope, name)
+    def __init__(self, img_size=(32, 32), targ_img_size=(128, 128), seed=1010, strategy_scope=None, apply_resize=None, name="DISC02", configbuild={}):
+        super(Discriminator_v1, self).__init__(img_size, targ_img_size , seed, strategy_scope, name, configbuild)
         self.cur_img_size = img_size
         self.suff = NameCaller()
-        
+        self.apply_resize = apply_resize
+
     def _initialize_base(self):
 
         cur_in = keras.layers.Input(shape=(*self.targ_img_size, 3))
@@ -362,7 +373,7 @@ class Discriminator_v1(BaseDiscriminator):
         self.model = keras.Model(cur_in, cur_out, name="DiscModel_"+self.name)
         
     def forward_model(self, inputs, training=True):
-        if self.cur_img_size != self.targ_img_size: # fixed model, upsample first
+        if (self.cur_img_size != self.targ_img_size and self.apply_resize): # fixed model, upsample first
             shapex = inputs.shape[1:-1][0]
             multiplier = int(self.targ_img_size[0] / shapex)
             if multiplier > 1:

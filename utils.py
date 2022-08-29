@@ -24,6 +24,7 @@ class DefaultConfig(object):
     train_ratio = None
     grad_penalty = 2
     applied_D_method = "resize"
+    applied_G_method = None
     switch_ratio = {"G" : 2, "D" : 1}
     
     def __init__(self, **kwargs):
@@ -115,7 +116,7 @@ def linear_annealing(step, total_steps, lr_max, lr_min):
 
 class AlphaDecay:
 
-    def __init__(self, total_steps, lr_max=0.0001, lr_min=0.000001, decay_type="linear"):
+    def __init__(self, total_steps, lr_max=0.0001, lr_min=0.000001, decay_type="cosine"):
         
         self.decay_type = decay_type
         self.total_steps = total_steps
