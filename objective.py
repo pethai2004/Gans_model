@@ -35,7 +35,7 @@ def discrim_loss_0(z, G, D, train_sets, g_penalty=0.):
         disc_loss += gd_Loss
     else:
         gd_Loss = 0.
-    return disc_loss, gd_Loss
+    return disc_loss, gd_Loss, (fake_score, real_score)
 
 def generator_loss_wg(z, G, D, train_sets):
     fake_img = G.forward_model(z)
@@ -57,4 +57,4 @@ def discrim_loss_wg(z, G, D, train_sets, g_penalty=0.):
         disc_loss += gd_Loss
     else:
         gd_Loss = 0.
-    return disc_loss, gd_Loss
+    return disc_loss, gd_Loss, (fake_score, real_score)

@@ -1,423 +1,414 @@
 import tensorflow as tf
-from tensorflow import keras
 import numpy as np
-#TODO : change processing in forward_model call in generator to be preprocessed in data_handler instead 
+from keras.layers import Layer, Input, Dense, Conv2D, UpSampling2D, Reshape, LeakyReLU, Activation, Flatten, MaxPooling2D
+from keras.activations import relu, selu
+from keras.initializers import GlorotNormal, RandomNormal
+from tensorflow_addons.layers import InstanceNormalization
 
-def get_deconv(x0, filters, kernel_size=(5, 5), strides=(1, 1), padding="same", activation='relu', initializer=None, 
-                   add_noise=None, max_norm=None, batch_norm=True, name_suffix=""):
-    if initializer is None:
-        initializer = keras.initializers.RandomNormal(stddev=0.01)
-    with tf.name_scope("deconv_up"):
-        x0 = keras.layers.Conv2DTranspose(filters, kernel_size, strides, padding=padding, activation=activation, 
-                                                  use_bias=True, kernel_initializer=initializer, name="ConvTrans"+name_suffix)(x0)
-    if add_noise:
-        x0 = add_noise(x0, name_suffix=name_suffix)
-    if max_norm is not None:
-        x0 = keras.constraints.MinMaxNorm(min_value=-max_norm, max_value=max_norm, rate=1.0, axis=0, name="MinMax"+name_suffix)(x0)
-    if batch_norm:
-        x0 = keras.layers.BatchNormalization(name="BatchNorm"+name_suffix)(x0)
-    # x0 = tf.cast(x0, tf.float32)
-    return x0
+from utils import NameCaller, function_call
 
-def get_upsampling(x0, filters, kernel_size, strides, padding="same", up_size=(2, 2), 
-                       activation='relu', interpolation="nearest", initializer=None, add_noise=None, batch_norm=True, name_suffix=""):
-    if initializer is None:
-        initializer = keras.initializers.RandomNormal(stddev=0.01)
-    with tf.name_scope("upsampling"):
-        x0 = keras.layers.UpSampling2D(up_size, interpolation=interpolation, name="Upsampling"+name_suffix)(x0)
-        x0 = keras.layers.Conv2D(filters, kernel_size, strides, padding, use_bias=True, 
-                                         kernel_initializer=initializer, activation=activation, name="Conv2D"+name_suffix)(x0)
-    if add_noise:
-        x0 = add_noise(x0, name_suffix=name_suffix)
-    if batch_norm:
-        x0 = keras.layers.BatchNormalization(name="BatchNorm"+name_suffix)(x0)
-    # x0 = tf.cast(x0, tf.float32)
-    return x0
+class AdaIN(Layer):
 
-def latent_mapping(x0, num_layers=8, units=128, out_units=1024, activation='selu', initializer=None, max_norm=None, batch_norm=True, namemap="map_z", name_suffix=""):
-    if initializer is None:
-        initializer = keras.initializers.RandomNormal(stddev=0.01)
-    with tf.name_scope("map_latent_z"):
-        for n in range(num_layers - 1):
-            x0 = keras.layers.Dense(units, activation=activation, kernel_initializer=initializer, name=namemap+str(n))(x0)
-            if max_norm is not None:
-                x0 = keras.constraints.MinMaxNorm(min_value=-max_norm, max_value=max_norm, rate=1.0, axis=0, name="MinMax"+name_suffix)(x0)
-        x0 = keras.layers.Dense(out_units, activation=activation, kernel_initializer=initializer, name=namemap+str(num_layers-1))(x0)
-    if batch_norm:
-        x0 = keras.layers.BatchNormalization(name="BatchNorm"+name_suffix)(x0)
-    # x0 = tf.cast(x0, tf.float32)
-    return x0
+    def __init__(self, **kwargs):
+        super(AdaIN, self).__init__(**kwargs)
 
-def get_noise_out(x0, stddev=0.1, name_suffix=""):
-    with tf.name_scope("add_noise"):
-        x0 = keras.layers.GaussianNoise(stddev, name="NoiseOut"+name_suffix)(x0)
-    # x0 = tf.cast(x0, dtype=tf.float32)
-    return x0
+    def build(self, input_shapes):
+        self.w_channels = input_shapes[1][-1]
+        self.x_channels = input_shapes[0][-1]
+        self.dense_1 = Dense(self.x_channels)
+        self.dense_2 = Dense(self.x_channels)
 
-def get_downsampling_conv(x0, filters, kernel_size=(5, 5), strides=(1, 1), padding="same", activation='relu', pooling=(2, 2), initializer=None, 
-                   add_noise=None, max_norm=None, batch_norm=True, name_suffix=""):
-    if initializer is None:
-        initializer = keras.initializers.RandomNormal(stddev=0.01)
-    with tf.name_scope("down_samping"):
-        x0 = keras.layers.Conv2D(filters, kernel_size, strides, padding=padding, activation=activation, 
-                                                  use_bias=True, kernel_initializer=initializer, name='Conv2D'+name_suffix)(x0)
-    if add_noise:
-        x0 = add_noise(x0, name_suffix=name_suffix)
-    if max_norm is not None:
-        x0 = keras.constraints.MinMaxNorm(min_value=-max_norm, max_value=max_norm, rate=1.0, axis=0, name="MinMax"+name_suffix)(x0)
-    if batch_norm:
-        x0 = keras.layers.BatchNormalization(name="BatchNorm"+name_suffix)(x0)
-    if pooling is not None:
-        x0 = keras.layers.MaxPooling2D(pool_size=pooling, strides=None, padding="same", name="MaxPool"+name_suffix)(x0)
-    # x0 = tf.cast(x0, tf.float32)
-    return x0
+    def call(self, inputs):
+        _x0, _w0 = inputs
+        ys = tf.reshape(self.dense_1(_w0), (-1, 1, 1, self.x_channels))
+        yb = tf.reshape(self.dense_2(_w0), (-1, 1, 1, self.x_channels))
+        return ys * _x0 + yb
 
-class NameCaller(object):
-    def __init__(self):
-        self.num = 0
-    @property
-    def n(self):
-        self.num += 1
-        return str(self.num).zfill(3)
-        
-class BaseGenerator:
+class MinSTD(Layer):
 
-    def __init__(self, img_size=(32, 32), targ_img_size=(128, 128), z_dim=200, seed=5005, strategy_scope=None, name="BaseGenerator", configbuild={}):
-        self.img_size = img_size
-        self.targ_img_size = targ_img_size
-        self.z_dim = z_dim
-        self.seed = seed
-        self.strategy_scope = strategy_scope
-        self.initializer = keras.initializers.RandomNormal(mean=0.0, stddev=0.05, seed=seed)
-        self.initialized = False
-        self.model = None
-        self.name = name
-        self.extendable = True
-        self.configbuild = configbuild
+    def __init__(self, group_size=4, **kwargs):
+        super(MinSTD, self).__init__(**kwargs)
+        self.group_size = group_size
+
+    def call(self, inputs):
+        with tf.name_scope('MinibatchStddev'):
+            group_size = tf.minimum(self.group_size, tf.shape(inputs)[0])    
+            s = inputs.shape                                             
+            y = tf.cast(tf.reshape(inputs, [group_size, -1, s[1], s[2], s[3]]), dtype=tf.float32)                         
+            y -= tf.reduce_mean(y, axis=0, keepdims=True)           
+            y = tf.sqrt(tf.reduce_mean(tf.square(y), axis=0) + 1e-8)              
+            y = tf.cast(tf.reduce_mean(y, axis=[1,2,3], keepdims=True), inputs.dtype)                                 
+            y = tf.tile(y, [group_size, 1, s[2], s[3]])      
+
+        return tf.concat([inputs, y], axis=1)                        
+
+class Noise(Layer):
+    
+    def build(self, input_shape):
+        n, h, w, c = input_shape[0]
+        initializer = RandomNormal(mean=0.0, stddev=1.0)
+        self.b = self.add_weight(
+            shape=[1, 1, 1, c], initializer=initializer, trainable=True, name="kernel"
+        )
+
+    def call(self, inputs):
+        x, noise = inputs
+        output = x + self.b * noise
+        return output
+
+class PixNorm(Layer):
+
+    def __init__(self, **kwargs):
+        super(PixNorm, self).__init__(**kwargs)
+
+    def call(self, inputs):
+        with tf.name_scope('PixelNorm'):
+            return inputs * tf.math.rsqrt(tf.reduce_mean(tf.square(inputs), axis=1, keepdims=True) + 1e-8)
+
+class Interpolate(Layer):
+
+    def __init__(self, **kwargs):
+        super(Interpolate, self).__init__(**kwargs)
+
+    def call(self, inputs):
+        x, y, alpha = inputs
+        return x + alpha * (y - x)
+    
+def get_noise(distribution, n):
+    with tf.name_scope("sampled_noise"):
+        return distribution.sample(n)
+
+class Generator:
+    '''Generator class
+    Inputs :
+        BuildConfig : BuildConfig object
+        save_path : path to save the model
+        strategy : tf distributed strategy to be used
+    '''
+    def __init__(self, BuildConfig, save_path="", strategy=None):
+        self.BuildConfig = BuildConfig
+        self._strategy = strategy
+        self._init_res_log2 = int(np.log2(self.BuildConfig.img_size[0]))
+        self._initializer = None
+        self._cur_img_size = 2 ** self._init_res_log2 # this will keep update when model is extended
+        self._out_map_shape = self.BuildConfig.G_dense_units[-1]
+        self._layer_n = NameCaller()
+        self._default_graph = None
+        self._is_initialized = False
+        self._initialized_model = None
+        self.save_path = ""
+        self._model = 45455
 
     def initialize_base(self):
-        assert self.initialized == False, "Generator already initialized"
-        self.initialized = True
-        if self.strategy_scope is not None:
-            with self.strategy_scope.scope():
-                self._initialize_base()
-        else:
+        if self._strategy is None:
             self._initialize_base()
-
-    def extent_model(self):
-        if self.strategy_scope is not None:
-            with self.strategy_scope.scope():
-                self.extend_model()
-        else:
-            self.extend_model()
-
-    def auto_extend(self):
-        if self.strategy_scope is not None:
-            with self.strategy_scope.scope():
-                self._auto_extend()
-        else:
-            self._auto_extend()
-
-    def _extend_model(self): raise NotImplementedError
-
-    def _initialize_base(self): raise NotImplementedError
-
-    def _auto_extend(self): raise NotImplementedError
-    
-    def forward_mapping(self, inputs):
-        '''forward mapping layer only'''
-        raise NotImplementedError
-    
-    def get_mapping_weights(self): raise NotImplementedError
-    
-    def forward_model(self, inputs, training=True):
-        inputs = self.model(inputs, training=training)
-        return tf.cast(inputs, dtype=tf.float32)
-    
-    def add_noise(self, inputs):
-        return inputs
-    
-    def set_latent(self, trainable=False):
-        '''Freezing trainable weights for latent mapping'''
-        raise NotImplementedError
-
-    def __repr__(self):
-        return self.name
-
-class BaseDiscriminator:
-
-    def __init__(self, img_size=(32, 32), targ_img_size=(128, 128), seed=1010, strategy_scope=None, name="DISC01", configbuild={}):
-        self.img_size = img_size
-        self.targ_img_size = targ_img_size
-        self.seed = seed
-        self.strategy_scope = strategy_scope
-        self.initializer = keras.initializers.RandomNormal(mean=0.0, stddev=0.05, seed=seed)
-        self.initialized = False
-        self.model = None
-        self.id = None
-        self.name = name
-        self.configbuild = configbuild
-        self.model = None
-
-    def initialize_base(self):
-        assert self.initialized == False, 'BaseDiscriminator already initialized'
-        self.initialized = True
-        if self.strategy_scope is not None:
-            with self.strategy_scope.scope():
-                self._initialize_base()
-        else:
-            self._initialize_base()
-
-    def extent_model(self):
-        assert self.img_size != self.targ_img_size, "provided img_size is equal to targ_img_size, so it cannot be extended"
-        if self.strategy_scope is not None:
-            with self.strategy_scope.scope():
-                self.extend_model()
-        else:
-            self.extend_model()
-
-    def auto_extend(self):
-        assert self.img_size != self.targ_img_size, "provided img_size is equal to targ_img_size, so it cannot be extended"
-        if self.strategy_scope is not None:
-            with self.strategy_scope.scope():
-                self._auto_extend()
-        else:
-            self._auto_extend()
-    
-    def _extend_model(self): raise NotImplementedError
-
-    def _initialize_base(self): raise NotImplementedError
-
-    def _auto_extend(self): raise NotImplementedError
-
-class Generator_v0(BaseGenerator):
-    
-    def __init__(self, img_size=(32, 32), targ_img_size=(128, 128), z_dim=128, seed=1010, strategy_scope=None, name="GEN01",
-                up_type="deconv", apply_resize=False, configbuild={}):
-        '''
-        Input : 
-            image_size : (tuple) target image size at starting training (before first extent model).
-            targ_img_size : (tuple) target image size at the end of training.
-            apply_resize : (bool) whether to resize the img_size to the targ_img_size if is not equal in the forward call.
-        '''
-
-        super(Generator_v0, self).__init__(img_size, targ_img_size, z_dim, seed, strategy_scope, name, configbuild)
-        assert up_type in ["deconv", "upsample"], "up_type must be one of deconv or upsample"
-        assert img_size[0] == img_size[1], "img_size must be square"
-        assert targ_img_size[0] == targ_img_size[1], "targ_img_size must be square"
-        self.up_type = up_type
-        self.blocks = []
-        self.cur_img_size = img_size
-        self.apply_resize = apply_resize
-        self.blocks = []
-        self.suff = NameCaller()
-        self.optimizer = None
-        self.cur_trainable = None # use just for creation of Variable that hold outside of tf.function
-        self._num_call_forw = 0
-        self._n_call = [len(k_) for k_ in self.configbuild["filters"]]
-        self._n_call.insert(0, 1)
-
-    def _initialize_base(self):
-        '''Initialize model for based layer map and conv'''
-        inputer = keras.layers.Input(shape=(self.z_dim, ), name="BaseInput"+self.suff.n)
-        x1 = latent_mapping(inputer, num_layers=self.configbuild["num_layers"], units=self.configbuild["dense_units"],
-                out_units=self.configbuild["out_units"], activation=self.configbuild["dense_act"], initializer=self.initializer, max_norm=None, 
-                batch_norm=True, namemap="map_z", name_suffix="")
-        
-        x1 = keras.layers.Reshape(target_shape=(1, 1, self.configbuild["out_units"]), name='reshape_mapper'+self.suff.n)(x1)
-
-        if self.up_type == "deconv":
-            for i_layer in self.configbuild["BaseFilters"]:
-                x1 = get_deconv(x1, i_layer, self.configbuild["kernel_size"], strides=(2, 2), padding="same", activation=self.configbuild["conv_act"], 
-                        initializer=self.initializer, add_noise=None, max_norm=None, batch_norm=True, name_suffix=self.suff.n)
-        
-        elif self.up_type == "upsample":
-            for i_layer in self.configbuild["BaseFilters"]:
-                x1 = get_upsampling(x1, i_layer, self.configbuild["kernel_size"], strides=(1, 1), padding="same", up_size=(2, 2), 
-                activation=self.configbuild["conv_act"], interpolation="nearest", initializer=self.initializer, add_noise=None, batch_norm=True, 
-                                    name_suffix=self.suff.n)
-                
-        outputer = keras.layers.Conv2D(3, self.configbuild["kernel_size"], strides=(1, 1), padding="same", activation=self.configbuild["out_act"], use_bias=True,
-                        name="BaseOutConv")(x1)
-        assert tf.reduce_prod(x1.shape[1:-1]) == tf.reduce_prod(self.img_size), "mapping blocks do not correctly output shape, "\
-        "must provide filters with length of {}".format(int(np.log2(self.img_size[0])))
-        self.blocks.append(keras.Model(inputer, outputer, name="BaseGeneratorModel"))
-
-    def _extend_model(self, filters=400, up=(1, 1), noise=False):
-        '''extent one convolutional blocks with either deconvolution or upsampling'''
-        if self.cur_img_size == self.targ_img_size:
-            assert (up == (1, 1) and filters==3), "extent model cannot be called when image size is equal to target image size"
-
-        if not self.initialized:
-            raise ValueError("Generator model not initialized")
-        inputer = keras.layers.Input(shape=self.blocks[-1].output_shape[1:], name="ExtendedInput"+self.suff.n)
-        self.cur_img_size = (self.cur_img_size[0] * up[0], self.cur_img_size[0] * up[1])
-        last_shape = self.blocks[-1].layers[-1].output_shape
-        
-        if self.up_type == "deconv":
-            outputer = get_deconv(inputer, filters, self.configbuild["kernel_size"], strides=up, padding="same",
-                activation=self.configbuild["conv_act"], initializer=self.initializer, add_noise=noise, max_norm=None, batch_norm=True, name_suffix=self.suff.n)
-        
-        elif self.up_type =="upsample":
-            outputer = get_upsampling(inputer, filters, self.configbuild["kernel_size"], strides=(1, 1), padding="same", 
-                up_size=up, activation=self.configbuild["conv_act"], interpolation="nearest", initializer=self.initializer, 
-                add_noise=noise, batch_norm=True, name_suffix=self.suff.n)
-            
-        if up[0] > 1:
-            outputer = keras.layers.Conv2D(3, (5, 5), strides=(1, 1), padding="same", activation=None, use_bias=True, name="Conv"+self.suff.n)(outputer)
-            assert tf.reduce_prod(outputer.shape[1:-1]) == tf.reduce_prod(self.cur_img_size), "extended model do not correctly output shape"\
-            "must provide filters with length of {}".format(int(np.log2(self.cur_img_size[0])))
-        self.blocks.append(keras.Model(inputer, outputer))
-        print("extended model from size of", last_shape, "to", outputer.shape)
-    
-    def _auto_extend(self):
-
-        '''extend model automatically with arbitrary number of blocks provided in configbuild'''
-        for ifilt in next(iter(self.configbuild["filters"]))[:-1]:
-            self._extend_model(ifilt, up=(1, 1))
-        self._extend_model(next(iter(self.configbuild["filters"]))[-1], up=(2, 2), noise=get_noise_out)
-
-    def set_mapping_trainable(self, trainable=True, prefix='map_z'):
-        for ly in self.get_flat_layers():
-            if prefix in ly.name:
-                ly.trainable = trainable
-                print("set trainable_variables of layers {} to {}".format(ly.name, trainable))
-    
-    def set_joint_trainable(self, trainable=True, not_prefix='map_z'):
-        for ly in self.get_flat_layers():
-            if not_prefix not in ly.name and ly.trainable_variables != []:  
-                ly.trainable = trainable
-                print("set trainable_variables of layers {} to {}".format(ly.name, trainable))
-                
-    def forward_model(self, inputs, training=True, full_forw=True): ############ use get_model instead of calling function sequentially, this may result in async weights update
-        full_forw = np.sum(self._n_call[:self._num_call_forw+1], dtype=np.int32) if not full_forw else None
-        for bk in self.blocks[:]:
-            inputs = bk(inputs)
-        if self.apply_resize: # this however should be preprocess in datasets data handler
-        #if (self.apply_resize and self.cur_img_size != self.targ_img_size):
-            inputs = tf.image.resize(inputs, self.targ_img_size, method="nearest")
-        return tf.cast(inputs, dtype=tf.float32)
-    
-    def get_model(self, get_with_functional=False, with_scope=False):
-        assert not get_with_functional
-        assert self.extendable, "This Generator is not extendable"
-        U_layers = self.blocks if get_with_functional else self.get_flat_layers()
-        inputer = keras.layers.Input(shape=(self.z_dim), name='BaseInput000')
-        xi = U_layers[1](inputer)
-        for J_layers in U_layers[2:]:
-            xi = J_layers(xi)
-        if with_scope: # this actually returns Model with scope since it is sync for all tf.Variable, Just in case 
-            with self.strategy_scope.scope():
-                return keras.Model(inputer, xi)
-        else:
-            return keras.Model(inputer, xi)
-    
-    def get_flat_layers(self):
-        lys = []
-        for msl in self.blocks:
-            for ms in msl.layers: 
-                lys.append(ms)
-        return lys
-    
-    def print_config_layers(self):
-        for i_layer in self.get_flat_layers():
-            print("Name:{} - in_shape:{} - out_shape:{} - trainable:{} - scope{}".format(
-            i_layer.name, i_layer.input_shape, i_layer.output_shape, i_layer.trainable, i_layer.name_scope()))
-    
-    def get_trainable(self, full_forw=False):
-        # self.cur_trainable = self.get_model().trainable_variables
-        self.cur_trainable = []
-        if full_forw:
-            for iu in self.get_flat_layers():
-                for s in iu.trainable_variables: self.cur_trainable.append(s)
         else : 
-            for iu in self.blocks[:np.sum(self._n_call[:self._num_call_forw+1], dtype=np.int32)]:
-                for s in iu.trainable_variables:  self.cur_trainable.append(s)
-        return self.cur_trainable
-
-    def update_params(self, grads):
-        assert self.optimizer is not None, "optimizer is not provided"
-        if self.cur_trainable is None: # this must not run in the context of tf.function since it create new variables
-            self.get_trainable()
-        self.optimizer.apply_gradients(zip(grads, self.cur_trainable))
-
-    def save_model(self, path):
-        self.get_model().save(path)
-
-class Discriminator_v1(BaseDiscriminator):
-    
-    def __init__(self, img_size=(32, 32), targ_img_size=(128, 128), seed=1010, strategy_scope=None, apply_resize=None, name="DISC02", configbuild={}):
-        super(Discriminator_v1, self).__init__(img_size, targ_img_size , seed, strategy_scope, name, configbuild)
-        self.cur_img_size = img_size
-        self.suff = NameCaller()
-        self.apply_resize = apply_resize
-
+            with self._strategy.scope():
+                self._initialize_base()
+                print("Initialize Generator with strategy")
+                
     def _initialize_base(self):
+        assert not self._is_initialized, "Generator is already initialized"
+        n_inputs = [] # list noise input
+        rgb_outs = []
+        if self._initializer is None:
+            self._initializer = self.BuildConfig.initializer if self.BuildConfig.initializer is not None else GlorotNormal(self.BuildConfig.seed)
+        if (self.BuildConfig.G_conv_act == "LeakyReLU" and self.BuildConfig.G_dense_act == "LeakyReLU"): 
+            conv_act = LeakyReLU
+            dense_act = LeakyReLU
+        else:
+            conv_act = Activation(self.BuildConfig.G_conv_act)
+            dense_act = Activation(self.BuildConfig.G_dense_act)
 
-        cur_in = keras.layers.Input(shape=(*self.targ_img_size, 3))
-        x1 = get_downsampling_conv(cur_in, self.configbuild["filters"][0][0], self.configbuild["kernel_size"], (1, 1), "same",  
-                self.configbuild["conv_act"], None, self.initializer, add_noise=None, max_norm=None, batch_norm=True, name_suffix=self.suff.n)
+        Ft = self.BuildConfig.G_filters # dict map log2(res) to filter
+        res = 2 ** self._init_res_log2 # initial resolution
+        with tf.name_scope("LatentMapping"):
+            map_input = Input(shape=self.BuildConfig.latent_dim, dtype=tf.float32, name='map_input'+self._layer_n.n)
+            x_ = map_input
+            for unit in self.BuildConfig.G_dense_units:
+                x_ = Dense(unit, kernel_initializer=self._initializer, name='dense_map'+self._layer_n.n)(x_)
+                x_ = dense_act(name="activation"+self._layer_n.n)(x_)
+                x_ = PixNorm(name="pixelnorm"+self._layer_n.n)(x_)
+            map_out = Reshape((1, 1, int(np.prod(x_.shape[1:]))), name='reshape_map'+self._layer_n.n)(x_)
         
-        for drop in self.configbuild["filters"][1:-1]:
+        with tf.name_scope("ConstConv"): # Base Conv 4x4
+            const_input = Input(shape=(res, res, Ft[res]), name='const_input'+self._layer_n.n)
+            noise_input = Input(shape=(res, res, 1), dtype=tf.float32, name='noise_input'+self._layer_n.n) # from convolution
+            n_inputs.append(noise_input)
+            for _ in range(2):
+                x_ = Conv2D(Ft[res], self.BuildConfig.G_kernel_size, (1, 1), padding="same", kernel_initializer=self._initializer, name='conv_up'+self._layer_n.n)(const_input)
+                x_ = Noise(trainable=True, name="Noise"+self._layer_n.n)([x_, noise_input])
+                x_ = conv_act(name="activation"+self._layer_n.n)(x_)
+                x_ = AdaIN()([x_, map_out]) # shape ([None, res, res, 3], [None, map_output])
+                
+        def extend_rgb(x_k):
+            shape_rgb = str(x_k.shape[1])
+            with tf.name_scope("RGBTrans{}x{}".format(shape_rgb, shape_rgb)):
+                x_k = Conv2D(3, kernel_size=self.BuildConfig.G_kernel_size, padding="same", kernel_initializer=self._initializer, name='rgb'+self._layer_n.n)(x_k)
+            return x_k
+
+        def extend_model(inputs, filter, res):
+            # 0 : conv, 1 : noise, 2 : mapping
+            with tf.name_scope("UpConv{}x{}".format(res, res)):
+                x_ = UpSampling2D(size=(2, 2), interpolation='nearest', name="upsampling"+self._layer_n.n)(inputs[0])
+                for _ in range(2):
+                    x_ = Conv2D(filter, self.BuildConfig.G_kernel_size, strides=(1, 1), padding="same", kernel_initializer=self._initializer, name=''+self._layer_n.n)(x_)
+                    x_ = Noise(trainable=True, name="Noise"+self._layer_n.n)([x_, inputs[1]]) # noise input shape must be updated
+                    x_ = conv_act(name="activation"+self._layer_n.n)(x_)
+                    x_ = AdaIN()([x_, inputs[2]])
+                    x_ = InstanceNormalization(axis=-1, center=True, scale=True, name='InstanceNorm'+self._layer_n.n)(x_)
+            return x_
+
+        x_rgb_0 = extend_rgb(x_)
+        rgb_outs.append(x_rgb_0)
+        x_rgb_0 = UpSampling2D((2, 2), name="up_rgb"+self._layer_n.n)(x_rgb_0)
+
+        for i_ in range(int(np.log2(self.BuildConfig.targ_img_size[0])) - self._init_res_log2):
+            if i_ != 0:
+                x_rgb_0 = UpSampling2D((2, 2), name="up_rgb"+self._layer_n.n)(x_rgb_0)
+            res = 2 * res
+            noise_input = Input(shape=(res, res, 1), dtype=tf.float32, name='noise_input'+self._layer_n.n) # from convolution
+            n_inputs.append(noise_input)
+            x_ = extend_model([x_, noise_input, map_out], self.BuildConfig.G_filters[3], res)
+            x_rgb_1 = extend_rgb(x_)
             
-            x1 = get_downsampling_conv(x1, drop[0], self.configbuild["kernel_size"], (1, 1), "same",  
-                    self.configbuild["conv_act"], drop[1], self.initializer, add_noise=None, max_norm=None, batch_norm=True, name_suffix=self.suff.n)
+            with tf.name_scope("lerp"):
+                x_rgb_0 = Interpolate(name="interpolate"+self._layer_n.n)([x_rgb_0, x_rgb_1, self.BuildConfig.lerp])
+                rgb_outs.append(x_rgb_0)
+
+        self._is_initialized = True
+        self._initialized_model = (n_inputs, map_input, const_input, rgb_outs)
+
+    @property
+    def stages(self):
+        return int(np.log2(self.BuildConfig.targ_img_size[0])) - self._init_res_log2 + 1
+    
+    def _initialize_as_graph(self):
+        '''Get graph, should not be called directly'''
+        assert not self._is_initialized, "Generator is already initialized"
+        self._default_graph = tf.Graph()
+        with self._default_graph.as_default(): 
+            self._initialize_base()
+
+    def _get_easy_model(self, targ_res=None):
+        '''get model this provided targ_res which can be access via Generator._model'''
+        assert self._is_initialized, "Generator is not initialized"
+        if targ_res is not None : assert type(targ_res) == int, 'targ_res must be int'
+        if targ_res == None: targ_res = self._cur_img_size
+        idx_layers = int(np.log2(targ_res)) - self._init_res_log2 + 1
+        with tf.name_scope("SimpleGenerator"):
+            n_inputs, map_input, const_input, rgb_outs = self._initialized_model
+            self._model = tf.keras.Model([*n_inputs[:idx_layers], map_input, const_input], rgb_outs[:idx_layers])
+
+    def forward_model(self, inputs, training=True, targ_res=None):
+        '''Make inference to Generator
+        inputs (list) : input to the model
+        training (bool) : training mode
+        targ_res (int) : target resolution
+        '''
+        if targ_res is None : targ_res = self._cur_img_size
+        if targ_res != self._model.input_shape[-1][1] or self._model is None:
+            self._get_easy_model(targ_res=targ_res)
+        return self._model(inputs, training=training)
+    
+    def get_snap_rgb(self, inputs, targ_res=None):
+        '''Get snapshot of rgb image
+        inputs (list) : input to the model
+        targ_res (int) : target resolution
+        '''
+        if targ_res is None : targ_res = self._cur_img_size
+        return self.forward_model(inputs, False, targ_res=targ_res)[-1]
         
-            cur_out = get_downsampling_conv(x1, 3, kernel_size=self.configbuild["kernel_size"], strides=(1, 1), padding="same", 
-                        activation='relu', pooling=drop[1], initializer=self.initializer, add_noise=None, max_norm=None, batch_norm=True, name_suffix=self.suff.n)
-           
-        x1 = keras.layers.Flatten(name="flatten_d_conv")(x1)
-        for ui in self.configbuild["units_dense"]:
-            x1 = keras.layers.Dense(ui, activation=self.configbuild["dense_act"], use_bias=True, kernel_initializer=self.initializer, name="Dense"+self.suff.n)(x1)
-        cur_out = keras.layers.Dense(1, activation=self.configbuild["out_act"], name="OutDense"+self.suff.n)(x1)
-        self.model = keras.Model(cur_in, cur_out, name="DiscModel_"+self.name)
+    def save_model(self, targ_res=None):
+        '''Save_model'''
+        if targ_res is None : targ_res = self._cur_img_size
+        self._get_easy_model(targ_res=targ_res)
+        _save_path = self.save_path + "{}x{}".format(targ_res, targ_res)
+        self._model.save(_save_path) 
+        print("Saved Generator of {}x{} to {}".format(targ_res, targ_res, _save_path))
+
+    def load_partial(self, path_to_model):
+        '''Load partial model which will be used in transfer learning for current model. 
+        The loaded model can be smaller than current model which will only load the layers that are in common.'''
+        assert self._is_initialized, "Generator is not initialized"
+        _loaded_model = tf.keras.models.load_model(path_to_model)
+        _out_shape = _loaded_model.output_shape[-1][1]
+        _len_var = len(_loaded_model.trainable_variables)
+        self._get_easy_model(_out_shape)
+        self._model.trainable_variables[:_len_var] = _loaded_model.trainable_variables
+        print("Loaded Generator of {}x{} from {}".format(_out_shape, _out_shape, path_to_model))
+
+    def get_trainable(self, targ_res=None):
+        '''Get trainable variables'''
+        self._get_easy_model(targ_res=targ_res)
+        return self._model.trainable_variables
+
+    @property
+    def input_shape(self):
+        assert self._model is not None, "Generator is not initialized"
+        return [i[1:] for i in self._model.input_shape]
+    
+class Discriminator:
+    '''Discriminator class
+    Inputs : 
+        BuildConfig : BuildConfig class
+        exhuastive : either 'True', 'False' or 'full'. Note that user must provided as False.
+        save_path : path to save model
+        strategy : tf distributed strategy to be used
+    '''
+    def __init__(self, BuildConfig, save_path="", strategy=None):
+
+        self.BuildConfig = BuildConfig
+        self._strategy = strategy
+        self._init_res_log2 = int(np.log2(self.BuildConfig.img_size[0]))
+        self._initializer = None
+        self._cur_img_size = 2 ** self._init_res_log2 # this will keep update when model is extended
+        self._layer_n = NameCaller()
+        self._default_graph = None
+        self._is_initialized = False
+        self._initialized_model = None
+        self.save_path = ""
+        self.exhaustive = False
+        self._model = None
         
-    def forward_model(self, inputs, training=True):
-        if (self.cur_img_size != self.targ_img_size and self.apply_resize): # fixed model, upsample first
-            shapex = inputs.shape[1:-1][0]
-            multiplier = int(self.targ_img_size[0] / shapex)
-            if multiplier > 1:
-                inputs = keras.layers.UpSampling2D((multiplier, multiplier), interpolation="nearest")(inputs)  
-        return self.model(inputs, training=training)
-    
-    def get_trainable(self):
-        return self.model.trainable_variables
-
-    def update_params(self, grads):
-        assert self.optimizer is not None, "optimizer is not provided"
-        self.optimizer.apply_gradients(zip(grads, self.model.trainable_variables))
-    
-    def save_model(self, path):
-        self.model.save(path)
-
-class Generator_v1(BaseGenerator):
-    
-    def __init__(self, img_size=(32, 32), targ_img_size=None, z_dim=200, seed=5005, strategy_scope=None, name="BaseGenerator"):
-        assert targ_img_size is None, "targ_img_size must not be specified"
-        super(Generator_v1, self).__init__(img_size, targ_img_size, z_dim, seed, strategy_scope, name)
-        self.extendable = False
-        self.out_latent = 300
-
+    def initialize_base(self):
+        if self._strategy is None:
+            self._initialize_base()
+        else : 
+            with self._strategy.scope():
+                self._initialize_base()
+                print("Initialize Discriminator with strategy")
+                
     def _initialize_base(self):
-        input_dims = keras.layers.Input(shape=(self.z_dim, ))
+        assert not self._is_initialized, "Discriminator is already initialized"
+        if self._initializer is None:
+            self._initializer = self.BuildConfig.initializer if self.BuildConfig.initializer is not None else GlorotNormal(self.BuildConfig.seed)
+        if (self.BuildConfig.D_conv_act == "LeakyReLU" and self.BuildConfig.D_dense_act == "LeakyReLU"): 
+            conv_act = LeakyReLU
+            dense_act = LeakyReLU
+        else:
+            conv_act = Activation(self.BuildConfig.D_conv_act)
+            dense_act = Activation(self.BuildConfig.D_dense_act)
+        if not self.exhaustive:
+
+            Ft = self.BuildConfig.D_filters
+            rgb_ins, blocks = [], []
+            def li(_r): return int(np.log2(_r))
         
-        xk = keras.layers.Dense(256, activation='relu')(input_dims)
-        xk = keras.layers.Dense(self.out_latent)(xk)
-        xk = keras.layers.Reshape((1, 1, self.out_latent))(xk)
-        xk = keras.layers.Conv2DTranspose(300, (5, 5), strides=(1, 1), padding='same', activation='relu', 
-                                              use_bias=True, kernel_initializer=self.initializer)(xk)
-        xk = keras.layers.Conv2DTranspose(400, (5, 5), strides=(1, 1), padding='same', activation='relu', 
-                                              use_bias=True, kernel_initializer=self.initializer)(xk)
-        xk = keras.layers.Conv2DTranspose(400, (5, 5), strides=(1, 1), padding='same', activation='relu', 
-                                              use_bias=True, kernel_initializer=self.initializer)(xk)
-        xk = keras.layers.Conv2DTranspose(500, (5, 5), strides=(1, 1), padding='same', activation='relu', 
-                                              use_bias=True, kernel_initializer=self.initializer)(xk)
-        xk = keras.layers.Flatten()(xk)
-        xk = keras.layers.Dense(200)(xk)
-        xk = keras.layers.Dense(tf.reduce_prod(self.img_size) * 3)(xk)
-        xk = keras.layers.Reshape(self.img_size)(xk)
+            def _f_rgb(res_, filters):
+                ins = Input((res_, res_, 3), name="rgb_in"+self._layer_n.n)
+                outs = Conv2D(filters, self.BuildConfig.D_kernel_size, padding="same", kernel_initializer=self._initializer, 
+                                            name="rgb_conv{}x{}".format(res_, res_)+self._layer_n.n)(ins)
+                outs = conv_act(name="act{}x{}".format(res, res)+self._layer_n.n)(outs)
+                return tf.keras.Model(ins, outs)
+            
+            def _f_base(filters0, res_):
+                ins = Input((res_, res_, filters0), name="conv_in"+self._layer_n.n)
+                x_k = MinSTD(group_size=4)(ins)
+                x_k = Conv2D(filters0, self.BuildConfig.D_kernel_size, padding="same", kernel_initializer=self._initializer, 
+                                            name="conv{}x{}".format(res_, res_)+self._layer_n.n)(x_k)
+                x_k = conv_act(name="act{}x{}".format(res, res)+self._layer_n.n)(x_k)
+                
+                with tf.name_scope("dense_blocks"):
+                    x_k = Flatten(name="flatten"+self._layer_n.n)(x_k)
+                    for unit in self.BuildConfig.D_dense_units:
+                        x_k = Dense(unit, kernel_initializer=self._initializer, name="dense"+self._layer_n.n)(x_k)
+                        x_k = dense_act(name="act"+self._layer_n.n)(x_k)
+                    x_k = Dense(1, kernel_initializer=self._initializer, name="dense"+self._layer_n.n)(x_k)
+                return tf.keras.Model(ins, x_k)
+            
+            def _f_conv_bloc(res_, filters0, filters1, minstd=False):
+                ins = Input((res_, res_, filters0), name="conv_in"+self._layer_n.n)
+                if minstd: x_k = MinSTD(group_size=4)(ins)
+                else:
+                     x_k = ins
+                for filt in [filters0, filters1]:
+                    x_k = Conv2D(filt, self.BuildConfig.D_kernel_size, padding="same", kernel_initializer=self._initializer, 
+                                                name="conv{}x{}".format(res_, res_)+self._layer_n.n)(x_k)
+                    x_k = conv_act(name="act{}x{}".format(res, res)+self._layer_n.n)(x_k)
+                x_k = MaxPooling2D((2, 2), name="pool{}x{}".format(res_, res_)+self._layer_n.n)(x_k)
+                return tf.keras.Model(ins, x_k)
+            
+            with tf.name_scope("DiscrimConv"):
+                for r_ in range(self._init_res_log2, li(self.BuildConfig.targ_img_size[0]) + 1):
+                    res = 2 ** r_
+                    with tf.name_scope("conv_block{}x{}".format(res, res)):
+                        rgb_ins.append(_f_rgb(res_=res, filters=Ft[li(res)]))
+                        if r_ == self._init_res_log2:
+                            blocks.append(_f_base(Ft[li(res)], res))
+                        else:
+                            blocks.append(_f_conv_bloc(res, Ft[li(res)], Ft[li(res) - 1]))                
+        else:
+            raise NotImplementedError
+        self._is_initialized = True
+        self._initialized_model = (rgb_ins, blocks)
+    
+    def _initialize_as_graph(self):
+        '''Get graph, should not be called directly'''
+        assert not self._is_initialized, "Discriminator is already initialized"
+        self._default_graph = tf.Graph()
+        with self._default_graph.as_default():
+            _ = self._initialize_base()
+            
+    def _get_easy_model(self, targ_res=None):
+        '''get model this provided targ_res which can be access via Generator._model'''
+        assert self._is_initialized, "Discriminator is not initialized"
+        if targ_res == None: targ_res = self._cur_img_size
+        _res = 2 ** targ_res
+        _idx = int(np.log2(targ_res)) - self._init_res_log2
+        _alp = Input(shape=(1), name="alpha_lerp"+self._layer_n.n)
+        _img_in = Input(shape=(targ_res, targ_res, 3), name='img_in'+self._layer_n.n)
+        x_rgb_0 = function_call(self._initialized_model[0][_idx], _img_in)
+        x_rgb_0 = function_call(self._initialized_model[1][_idx], x_rgb_0)
         
-        self.model = keras.Model(input_dims, xk)
-        
-    def forward_model(self, input_tensor, training=True):
-        return self.model(input_tensor, training=training)
+        if _idx > 0:
+            _idx -= 1
+            x_rgb_1 = MaxPooling2D((2, 2), name="pool{}x{}".format(targ_res, targ_res)+self._layer_n.n)(_img_in)
+            x_rgb_1 = function_call(self._initialized_model[0][_idx], x_rgb_1)
+
+            with tf.name_scope("lerp"):
+                x_rgb_0 = Interpolate(name="interpolate"+self._layer_n.n)([x_rgb_0, x_rgb_1, self.BuildConfig.lerp])
+            for i in range(_idx, -1, -1):
+                x_rgb_0 = function_call(self._initialized_model[1][i], x_rgb_0)
+        with tf.name_scope("SimpleDiscriminator"):
+            self._model = tf.keras.Model([_img_in, _alp], x_rgb_0)
+
+    def forward_model(self, input, training=True, targ_res=None):
+        '''Make inference to Discriminator
+            inputs (list) : input to the model
+            training (bool) : training mode
+            targ_res (int) : target resolution
+        '''
+        if targ_res is None : targ_res = self._cur_img_size
+        if targ_res != self._model.input_shape[0][1] or self._model is None:
+            self._get_easy_model(targ_res)
+        return self._model(input, training=training)
+
+    def save_model(self, targ_res=None):
+        '''Save_model'''
+        if targ_res is None : targ_res = self._cur_img_size
+        self._get_easy_model(targ_res=targ_res)
+        _save_path = self.save_path + "{}x{}".format(targ_res, targ_res)
+        self._model.save(_save_path)
+        print("Saved Discriminator of {}x{} to {}".format(targ_res, targ_res, _save_path))
+
+    def load_partial(self, path_to_model):
+        '''Load partial model which will be used in transfer learning for current model. 
+        The loaded model can be smaller than current model which will only load the layers that are in common.'''
+        assert self._is_initialized, "Discriminator is not initialized"
+        _loaded_model = tf.keras.models.load_model(path_to_model)
+        _out_shape = _loaded_model.output_shape[-1][1]
+        _len_var = len(_loaded_model.trainable_variables)
+        self._get_easy_model(_out_shape)
+        self._model.trainable_variables[:_len_var] = _loaded_model.trainable_variables
+        print("Loaded Discriminator of {}x{} from {}".format(_out_shape, _out_shape, path_to_model))
+
+    def get_trainable(self, targ_res=None):
+        '''Get trainable variables'''
+        self._get_easy_model(targ_res=targ_res)
+        return self._model.trainable_variables
+    
+    @property
+    def input_shape(self):
+        assert self._model is not None, "Discriminator is not initialized"
+        return [i[1:] for i in self._model.input_shape]
